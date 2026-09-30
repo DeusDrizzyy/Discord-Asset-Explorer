@@ -109,6 +109,34 @@ It is not affiliated with, endorsed by, or associated with Discord Inc.
 
 Discord and related trademarks are the property of their respective owners.
 
+---
+
+## Contributors
+
+<table>
+  <tr>
+    <td align="center" width="200">
+      <a href="https://github.com/DeusDrizzyy">
+        <img src="https://github.com/DeusDrizzyy.png?size=140" width="120" height="120" style="border-radius: 50%;" alt="DeusDrizzyy" />
+        <br />
+        <strong>DeusDrizzyy</strong>
+      </a>
+      <br />
+      <sub>Creator &amp; Maintainer</sub>
+    </td>
+    <td align="center" width="200">
+      <a href="https://github.com/ItzMeShadow999">
+        <img src="https://github.com/ItzMeShadow999.png?size=140" width="120" height="120" style="border-radius: 50%;" alt="ItzMeShadow999" />
+        <br />
+        <strong>ItzMeShadow999</strong>
+      </a>
+      <br />
+      <sub>Contributor</sub>
+    </td>
+  </tr>
+</table>
+
+Contributions are always welcome. Feel free to open an issue or submit a pull request.
 
 ---
 

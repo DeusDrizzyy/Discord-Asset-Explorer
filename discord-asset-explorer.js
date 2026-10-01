@@ -1,21 +1,52 @@
 (() => {
+	window.__assetExplorerDispose?.();
 	const EXTENSIONS = {
-		images: new Set(["png", "jpg", "jpeg", "webp", "gif", "avif", "svg", "ico"]),
-		videos: new Set(["mp4", "webm"]),
-		audios: new Set(["mp3", "ogg", "wav"]),
-		fonts: new Set(["woff", "woff2", "ttf", "otf"]),
-		others: new Set(["json", "wasm", "css", "js"]),
+		images: new Set(["png", "jpg", "jpeg", "jfif", "webp", "gif", "apng", "avif", "bmp", "svg", "ico", "tiff"]),
+		videos: new Set(["mp4", "webm", "mov", "m4v", "ogv", "mkv", "m3u8"]),
+		audios: new Set(["mp3", "ogg", "wav", "m4a", "aac", "flac", "opus", "weba"]),
+		fonts: new Set(["woff", "woff2", "ttf", "otf", "eot", "ttc"]),
+		others: new Set(["json", "wasm", "css", "js", "xml", "txt", "webmanifest", "lottie", "rlottie", "pdf", "vtt", "glsl", "rive"]),
 	};
 	const ALL_EXTENSIONS = new Set(Object.values(EXTENSIONS).flatMap(set => [...set]));
+	const buildAssetRe = () => {
+		const e = [...ALL_EXTENSIONS].join("|");
+		const exclude = "[^\"'`\\\\\\s){}$]+";
+		return new RegExp(
+			"(?:https?:\\\\?/\\\\?/(?:cdn\\.discordapp\\.com|media\\.discordapp\\.net)" +
+				exclude +
+				")|" +
+				"(?:(?:\\\\?/?assets\\\\?/)?(?:[a-fA-F0-9_-]{8,})\\.(?:" +
+				e +
+				"))|" +
+				"(?:https?:\\\\?/\\\\?/" +
+				exclude +
+				"\\.(?:" +
+				e +
+				"))",
+			"gi"
+		);
+	};
 
-	const escapeHTML = str => String(str).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[m]);
-	const debounce = (func, wait) => {
-		let timeout;
-		return (...args) => {
-			clearTimeout(timeout);
-			timeout = setTimeout(() => func.apply(this, args), wait);
+	const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" };
+	const escapeHTML = v => {
+		v = String(v);
+		return /[&<>"']/.test(v) ? v.replace(/[&<>"']/g, m => ESC[m]) : v;
+	};
+	const timers = new Set();
+	const debounce = (fn, wait) => {
+		let t;
+		return (...a) => {
+			clearTimeout(t);
+			timers.delete(t);
+			t = setTimeout(() => {
+				timers.delete(t);
+				fn(...a);
+			}, wait);
+			timers.add(t);
 		};
 	};
+	const COLL = new Intl.Collator();
+	const SHARED = { assets: new Map(), meta: new Map(), mods: new Set(), chunks: new Set(), tried: new Set(), sheets: new WeakSet() };
 	const sleep = ms => new Promise(r => setTimeout(r, ms));
 	const fileOf = url => String(url).split(/[?#]/)[0].split("/").pop() || String(url);
 	const fmtTime = t => {
@@ -45,10 +76,10 @@
 			} catch (e) {}
 			if (!cached) {
 				try {
-					const f = document.createElement("iframe");
+					const f = document.getElementById("__asset_explorer_store__") || document.createElement("iframe");
 					f.id = "__asset_explorer_store__";
 					f.style.display = "none";
-					document.body.appendChild(f);
+					f.isConnected || document.body.appendChild(f);
 					cached = f.contentWindow.localStorage || null;
 				} catch (e) {
 					cached = null;
@@ -81,7 +112,7 @@
 		const t = new Uint32Array(256);
 		for (let n = 0; n < 256; n++) {
 			let c = n;
-			for (let k = 0; k < 8; k++) c = c && 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+			for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
 			t[n] = c >>> 0;
 		}
 		return t;
@@ -146,20 +177,24 @@
 			end.setUint16(10, this.count, true);
 			end.setUint32(12, cdSize, true);
 			end.setUint32(16, this.offset, true);
-			return new Blob([...this.parts, ...this.central, end.buffer], { type: "application/zip" });
+			const blob = new Blob([...this.parts, ...this.central, end.buffer], { type: "application/zip" });
+			this.parts = this.central = null;
+			return blob;
 		}
 	}
 
 	class DiscordAssetExplorer {
-		constructor() {
+		constructor(onClose) {
 			document.getElementById("__asset_explorer__")?.remove();
 			document.getElementById("__asset_lightbox__")?.remove();
-			this.assets = new Map();
+			this.onClose = onClose;
+			this.assets = SHARED.assets;
+			this.meta = SHARED.meta;
 			this.pageSize = 80;
-			this.visibleCount = this.pageSize;
+			this.visibleCount = 80;
+			this.rendered = 0;
 			this.wreq = null;
 			this.selected = new Set();
-			this.meta = new Map();
 			this.metaEls = new Map();
 			this.sizeQueue = [];
 			this.sizeActive = 0;
@@ -178,17 +213,24 @@
 			this.sizeLimit = 4;
 			this._mPending = 0;
 			this._mTimer = null;
+			this._imgs = new Map();
+			this.ac = new AbortController();
+			this.peakCache = new Map();
+			this.peakQueue = [];
+			this.peakActive = 0;
 			this.destroyed = false;
 			this.init();
 		}
 
 		init() {
-			console.group("%cDiscord Asset Explorer", "color:#5865f2;font-size:16px;font-weight:bold");
 			this.hookWebpack();
 			this.extractAll();
 			this.assetList = this.buildAssetList();
-			console.log("✅ " + this.assetList.length + " assets found.");
-			console.groupEnd();
+			console.log(
+				"%c[ _Dr1zzyx_ ] Discord Asset Explorer",
+				"color:#5865f2;font-weight:bold",
+				"\u2705 " + this.assetList.length + " assets found. Toggle: Ctrl+Shift+K"
+			);
 			this.exportGlobals();
 			this.renderUI();
 		}
@@ -198,6 +240,7 @@
 			this.extractFromPerformance();
 			this.extractFromDOM();
 			this.extractFromCSS();
+			this.extractFromCacheStorage();
 		}
 
 		hookWebpack() {
@@ -239,11 +282,38 @@
 			return null;
 		}
 
+		async extractFromCacheStorage() {
+			try {
+				const cacheNames = await caches.keys();
+				for (const name of cacheNames) {
+					const cache = await caches.open(name);
+					const cachedRequests = await cache.keys();
+					for (const req of cachedRequests) {
+						this.addAsset(req.url, "browser_cache");
+					}
+				}
+			} catch (e) {}
+		}
+
 		addAsset(raw, source, moduleId = null) {
 			const url = this.normalizeURL(raw);
-			if (!url) return;
-			const extension = this.getExtension(url);
-			if (!ALL_EXTENSIONS.has(extension) && !url.startsWith("data:") && !url.startsWith("blob:")) return;
+			if (!url || url.endsWith("/") || url.includes("${") || url.includes("#{")) return;
+
+			let extension = this.getExtension(url);
+			const isDiscordCDN = url.includes("cdn.discordapp.com") || url.includes("media.discordapp.net");
+
+			if (!extension && isDiscordCDN) {
+				const parts = url.split("?")[0].split("/");
+				const lastPart = parts[parts.length - 1];
+				if (lastPart && !lastPart.includes(".") && lastPart.length > 5 && parts.length > 3) {
+					extension = "webp";
+				} else {
+					return;
+				}
+			}
+
+			if (!ALL_EXTENSIONS.has(extension) && !url.startsWith("data:") && !url.startsWith("blob:") && !isDiscordCDN) return;
+
 			let item = this.assets.get(url);
 			if (!item) {
 				item = { url, extension, sources: new Set(), modules: new Set() };
@@ -254,18 +324,24 @@
 		}
 
 		extractFromWebpack() {
-			if (!this.wreq || !this.wreq.m) return;
-			const extPattern = [...ALL_EXTENSIONS].join("|");
-			const assetRegex = new RegExp("(?:https?:\\/\\/[^\"'\\\\\\s\\)]+|\\/?assets\\/[^\"'\\\\\\s\\)]+|[a-f0-9]{8,}\\.(?:" + extPattern + "))", "gi");
-			for (const [moduleId, fn] of Object.entries(this.wreq.m)) {
+			const m = this.wreq?.m;
+			if (!m) return;
+			const assetRe = buildAssetRe();
+			const chunkRe = /\.e\(\s*["']?(\d+)["']?\s*\)/g;
+			for (const id in m) {
+				if (SHARED.mods.has(id)) continue;
+				SHARED.mods.add(id);
+				let code;
 				try {
-					const source = fn.toString();
-					assetRegex.lastIndex = 0;
-					let match;
-					while ((match = assetRegex.exec(source)) !== null) {
-						this.addAsset(match[0], "webpack", moduleId);
-					}
-				} catch {}
+					code = m[id].toString();
+				} catch {
+					continue;
+				}
+				let x;
+				assetRe.lastIndex = 0;
+				while ((x = assetRe.exec(code))) this.addAsset(x[0], "webpack", id);
+				chunkRe.lastIndex = 0;
+				while ((x = chunkRe.exec(code))) SHARED.chunks.add(x[1]);
 			}
 		}
 
@@ -287,34 +363,53 @@
 		}
 
 		extractFromCSS() {
-			const regex = /url\(["']?([^"')]+)["']?\)/g;
-			const walkRules = rules => {
-				for (const rule of rules) {
-					if (rule.cssRules) walkRules(rule.cssRules);
-					regex.lastIndex = 0;
-					let match;
-					while ((match = regex.exec(rule.cssText || "")) !== null) {
-						this.addAsset(match[1], "css");
-					}
+			const re = /url\(["']?([^"')]+)["']?\)/g;
+			const walk = rules => {
+				for (const r of rules) {
+					const nested = r.cssRules?.length;
+					if (nested) walk(r.cssRules);
+					if (nested && !r.style) continue;
+					const t = r.cssText;
+					if (!t || !t.includes("url(")) continue;
+					re.lastIndex = 0;
+					let x;
+					while ((x = re.exec(t))) this.addAsset(x[1], "css");
 				}
 			};
-			for (const sheet of [...document.styleSheets]) {
+			for (const sheet of document.styleSheets) {
+				if (SHARED.sheets.has(sheet)) continue;
 				try {
-					if (sheet.cssRules) walkRules(sheet.cssRules);
+					if (sheet.cssRules) walk(sheet.cssRules);
+					SHARED.sheets.add(sheet);
 				} catch {}
 			}
 		}
 
 		buildAssetList() {
-			return [...this.assets.values()]
-				.map(item => ({ url: item.url, extension: item.extension, sources: [...item.sources], modules: [...item.modules] }))
-				.sort((a, b) => a.extension.localeCompare(b.extension) || a.url.localeCompare(b.url));
+			this.rows = [...this.assets.values()]
+				.map(i => {
+					const sources = [...i.sources];
+					const modules = [...i.modules];
+					const name = fileOf(i.url);
+					return {
+						url: i.url,
+						extension: i.extension,
+						sources,
+						modules,
+						name,
+						_l: name.toLowerCase(),
+						_s: new Set(sources.map(x => x.split(":")[0])),
+						_h: (i.url + " " + i.extension + " " + modules.join(" ") + " " + sources.join(" ")).toLowerCase(),
+					};
+				})
+				.sort((a, b) => COLL.compare(a.extension, b.extension) || COLL.compare(a.url, b.url));
+			return this.rows.map(({ url, extension, sources, modules }) => ({ url, extension, sources, modules }));
 		}
 
 		exportGlobals() {
 			window.__DISCORD_ASSETS__ = this.assetList;
 			window.__copyDiscordAssets = () => {
-				const json = JSON.stringify(this.assetList, null, 2);
+				const json = JSON.stringify(window.__DISCORD_ASSETS__, null, 2);
 				try {
 					copy(json);
 				} catch {
@@ -325,44 +420,125 @@
 
 		async scanChunks() {
 			if (this.busy) return;
-			if (!this.wreq?.m || !this.wreq.e) return this.setStatus("Webpack chunk loader not available.", null, 3000);
+			if (!this.wreq?.m) return this.setStatus("Webpack not available.", null, 3000);
 			this.busy = true;
-			const tried = new Set();
-			const idRegex = /\.e\(\s*["']?(\d+)["']?\s*\)/g;
+
 			const before = this.assets.size;
-			let done = 0;
-			let total = 0;
-			try {
-				for (let round = 0; round < 4; round++) {
-					const ids = new Set();
-					for (const fn of Object.values(this.wreq.m)) {
+			const crawled = (SHARED.crawled ||= new Set());
+			const assetRe = buildAssetRe();
+			const chunkRe = /\.e\(\s*["']?([\w$-]+)["']?\s*\)/g;
+			const cssRe = /url\(\s*["']?([^"')\s]+)["']?\s*\)/g;
+			const HOST = /(^|\.)(discord(app)?\.(com|net)|discord\.media)$/i;
+
+			this.setStatus("Starting hybrid scan...", 0);
+
+			if (typeof caches !== "undefined") {
+				try {
+					const cacheNames = await caches.keys();
+					for (const name of cacheNames) {
+						const cache = await caches.open(name);
+						const reqs = await cache.keys();
+						for (const req of reqs) this.addAsset(req.url, "browser_cache");
+					}
+				} catch (e) {}
+			}
+
+			const queueUrls = new Set();
+			const fns = () => [this.wreq.u, this.wreq.miniCssF].filter(f => typeof f === "function");
+
+			const seedIds = () => {
+				for (const fn of fns()) {
+					try {
+						for (const m of Function.prototype.toString.call(fn).matchAll(/[{,]\s*["']?([\w$-]+)["']?\s*:\s*["']([\w-]+)["']/g)) {
+							SHARED.chunks.add(m[1]);
+						}
+					} catch {}
+				}
+				for (const id in this.wreq.m) {
+					try {
+						const funcStr = this.wreq.m[id].toString();
+						const hashes = [...funcStr.matchAll(/["']([a-f0-9]{20,})["']/gi)];
+						hashes.forEach(h => {
+							queueUrls.add(new URL(`/assets/${h[1]}.js`, location.origin).href);
+							queueUrls.add(new URL(`/assets/${h[1]}.css`, location.origin).href);
+						});
+					} catch {}
+				}
+			};
+
+			for (let round = 0; round < 2; round++) {
+				seedIds();
+				for (const id of SHARED.chunks) {
+					if (SHARED.tried.has(id)) continue;
+					SHARED.tried.add(id);
+					for (const fn of fns()) {
 						try {
-							const src = fn.toString();
-							idRegex.lastIndex = 0;
-							let m;
-							while ((m = idRegex.exec(src)) !== null) if (!tried.has(m[1])) ids.add(m[1]);
+							const p = fn(id);
+							const u = p && !String(p).includes("undefined") && this.normalizeURL(p);
+							if (u) queueUrls.add(u);
 						} catch {}
 					}
-					if (!ids.size) break;
-					const queue = [...ids];
-					queue.forEach(id => tried.add(id));
-					total += queue.length;
-					const worker = async () => {
-						while (queue.length) {
-							const id = queue.shift();
-							try {
-								await Promise.race([this.wreq.e(id), sleep(15000).then(() => Promise.reject(new Error("timeout")))]);
-								if (typeof this.wreq.u === "function") this.addAsset(this.wreq.u(id), "chunk");
-							} catch {}
-							done++;
-							this.setStatus("Scanning chunks " + done + "/" + total + " (round " + (round + 1) + ")", (done / total) * 100);
-						}
-					};
-					await Promise.all(Array.from({ length: 6 }, worker));
 				}
+			}
+
+			document.querySelectorAll("script[src]").forEach(s => queueUrls.add(s.src));
+			for (const [u, a] of this.assets) {
+				if (crawled.has(u) || !/^(js|css|json)$/.test(a.extension) || !u.startsWith("http")) continue;
+				if (HOST.test(new URL(u).hostname)) queueUrls.add(u);
+			}
+
+			const queue = [...queueUrls].filter(u => !crawled.has(u));
+			queue.forEach(u => crawled.add(u));
+
+			let done = 0;
+			const total = queue.length;
+
+			const scan = (code, base, isCss) => {
+				let x;
+				if (isCss) {
+					cssRe.lastIndex = 0;
+					while ((x = cssRe.exec(code))) {
+						let u = x[1];
+						if (!/^(data|blob):/.test(u)) {
+							try {
+								u = new URL(u, base).href;
+							} catch {
+								continue;
+							}
+						}
+						this.addAsset(u, "chunk_css");
+					}
+					return;
+				}
+
+				assetRe.lastIndex = 0;
+				while ((x = assetRe.exec(code))) {
+					const cleanMatch = x[0].replace(/\\u002F/g, "/").replace(/\\\//g, "/");
+					this.addAsset(cleanMatch, "hybrid_js");
+				}
+
+				chunkRe.lastIndex = 0;
+				while ((x = chunkRe.exec(code))) SHARED.chunks.add(x[1]);
+			};
+
+			const worker = async () => {
+				while (queue.length > 0 && !this.destroyed) {
+					const url = queue.pop();
+					try {
+						const r = await fetch(url, { signal: this.ac.signal, cache: "force-cache" });
+						if (r.ok) scan(await r.text(), url, url.endsWith(".css") || url.includes(".css?"));
+					} catch {}
+					done++;
+					this.setStatus(`Scanning: ${done}/${total}...`, (done / total) * 100);
+				}
+			};
+
+			try {
+				await Promise.all(Array.from({ length: 10 }, worker));
+				if (this.destroyed) return;
 				this.extractAll();
 				this.refreshList();
-				this.setStatus("Chunk scan done: " + (this.assets.size - before) + " new assets from " + total + " chunks.", null, 4000);
+				this.setStatus(`Scan complete: ${this.assets.size - before} new assets from ${total} files.`, null, 5000);
 			} finally {
 				this.busy = false;
 			}
@@ -420,22 +596,22 @@
 
 		getHTMLTemplate() {
 			return `<style>
-:root { --ae-bg:#111214; --ae-card:#1e1f22; --ae-card-hover:rgba(88,101,242,.55); --ae-text:#dbdee1; --ae-muted:#949ba4; --ae-accent:#5865f2; --ae-border:rgba(255,255,255,.07); --ae-shadow:0 25px 100px rgba(0,0,0,.75); }
-#__asset_explorer__ { position:fixed; inset:0; z-index:2147483647; font-family:"gg sans",Whitney,Arial,sans-serif; color:var(--ae-text); animation:aeFadeIn .2s ease-out; }
+#__asset_explorer__ { --ae-bg:var(--background-base-lower,var(--background-tertiary,#111214)); --ae-bg2:var(--background-base-lowest,var(--background-tertiary,#17181a)); --ae-card:var(--background-surface-high,var(--background-secondary,#1e1f22)); --ae-card-hover:color-mix(in srgb,var(--ae-accent) 55%,transparent); --ae-text:var(--text-default,var(--text-normal,#dbdee1)); --ae-strong:var(--text-strong,var(--header-primary,#fff)); --ae-muted:var(--text-muted,#949ba4); --ae-subtle:var(--text-subtle,var(--text-muted,#80848e)); --ae-ico:var(--interactive-normal,#b5bac1); --ae-border:var(--border-subtle,var(--background-modifier-accent,rgba(255,255,255,.07))); --ae-border-hi:var(--border-normal,rgba(255,255,255,.16)); --ae-accent:var(--brand-500,#5865f2); --ae-accent-hover:var(--brand-560,#4752c4); --ae-link:var(--text-brand,var(--brand-360,#aeb5ff)); --ae-btn:var(--background-mod-normal,var(--background-modifier-selected,#2b2d31)); --ae-btn-hover:var(--background-mod-strong,var(--background-modifier-hover,#35373c)); --ae-pos:var(--status-positive,#23a559); --ae-pos-hover:color-mix(in srgb,var(--ae-pos) 80%,#000); --ae-neg:var(--status-danger,#f23f43); --ae-shadow:var(--elevation-high,0 25px 100px rgba(0,0,0,.75)); }
+#__asset_explorer__ { position:fixed; inset:0; z-index:2147483647; font-family:var(--font-primary,"gg sans",Whitney,Arial,sans-serif); color:var(--ae-text); animation:aeFadeIn .2s ease-out; }
 @keyframes aeFadeIn { from{opacity:0} to{opacity:1} }
 #__asset_explorer__ * { box-sizing:border-box; }
 #__asset_explorer__ ::-webkit-scrollbar { width:8px; }
-#__asset_explorer__ ::-webkit-scrollbar-track { background:var(--ae-bg); }
-#__asset_explorer__ ::-webkit-scrollbar-thumb { background:#2b2d31; border-radius:4px; }
-.ae-backdrop { position:absolute; inset:0; background:rgba(0,0,0,.8); backdrop-filter:blur(4px); display:flex; justify-content:center; align-items:center; padding:25px; }
-.ae-modal { width:min(1400px,97vw); height:min(900px,94vh); background:var(--ae-bg); border:1px solid var(--ae-border); border-radius:12px; box-shadow:var(--ae-shadow); display:flex; flex-direction:column; overflow:hidden; }
+#__asset_explorer__ ::-webkit-scrollbar-track { background:var(--scrollbar-thin-track,var(--ae-bg)); }
+#__asset_explorer__ ::-webkit-scrollbar-thumb { background:var(--scrollbar-thin-thumb,var(--ae-btn)); border-radius:4px; }
+.ae-backdrop { position:absolute; inset:0; background:rgba(0,0,0,.7); backdrop-filter:blur(4px); display:flex; justify-content:center; align-items:center; padding:25px; }
+.ae-modal { width:min(1400px,97vw); height:min(900px,94vh); background:var(--ae-bg); border:1px solid var(--ae-border); border-radius:12px; box-shadow:0 0 16px #373737; display:flex; flex-direction:column; overflow:hidden; }
 .ae-header { padding:18px 20px; border-bottom:1px solid var(--ae-border); display:flex; align-items:center; gap:14px; position:relative; }
 .ae-heading { flex:1; }
-.ae-heading h2 { margin:0; font-size:19px; color:#fff; }
+.ae-heading h2 { margin:0; font-size:19px; color:var(--ae-strong); }
 .ae-heading p { margin:4px 0 0; font-size:12px; color:var(--ae-muted); }
 .ae-close { border:0; width:36px; height:36px; border-radius:50%; background:transparent; color:var(--ae-muted); font-size:24px; cursor:pointer; transition:.2s; }
-.ae-close:hover { background:transparent; color:#fff; }
-.ae-toolbar { padding:10px 18px; display:flex; flex-wrap:wrap; gap:8px; border-bottom:1px solid var(--ae-border); background:#17181a; align-items:center; }
+.ae-close:hover { background:transparent; color:var(--ae-strong); }
+.ae-toolbar { padding:10px 18px; display:flex; flex-wrap:wrap; gap:8px; border-bottom:1px solid var(--ae-border); background:var(--ae-bg2); align-items:center; }
 .ae-input { height:36px; border:1px solid var(--ae-border); background:var(--ae-card); color:var(--ae-text); border-radius:8px; padding:0 10px; outline:none; transition:.2s; font-size:13px; }
 .ae-search { flex:1; min-width:200px; }
 .ae-input:focus { border-color:var(--ae-accent); }
@@ -445,44 +621,44 @@
 .ae-select { position:relative; display:inline-block; }
 .ae-select > select { display:none; }
 .ae-select-btn { display:flex; align-items:center; gap:8px; font-family:inherit; cursor:pointer; user-select:none; }
-.ae-select-btn:hover { border-color:rgba(255,255,255,.16); }
+.ae-select-btn:hover { border-color:var(--ae-border-hi); }
 .ae-select.open .ae-select-btn { border-color:var(--ae-accent); }
 .ae-select-label { display:grid; text-align:left; white-space:nowrap; }
 .ae-select-label > * { grid-area:1/1; }
 .ae-select-label .sz { visibility:hidden; height:0; overflow:hidden; pointer-events:none; }
 .ae-select-chev { flex:none; color:var(--ae-muted); transition:transform .28s cubic-bezier(.16,1,.3,1), color .15s; }
-.ae-select.open .ae-select-chev { transform:rotate(180deg); color:#fff; }
-.ae-select-menu { position:absolute; top:calc(100% + 6px); left:0; z-index:20; min-width:100%; width:max-content; max-width:340px; max-height:288px; overflow-y:auto; padding:6px; background:#1e1f22; border:1px solid var(--ae-border); border-radius:10px; box-shadow:var(--ae-shadow); visibility:hidden; opacity:0; transform:translateY(-8px) scale(.95); transform-origin:top left; pointer-events:none; will-change:opacity,transform; transition:opacity .15s cubic-bezier(.4,0,1,1), transform .18s cubic-bezier(.4,0,1,1), visibility 0s linear .18s; }
+.ae-select.open .ae-select-chev { transform:rotate(180deg); color:var(--ae-strong); }
+.ae-select-menu { position:absolute; top:calc(100% + 6px); left:0; z-index:20; min-width:100%; width:max-content; max-width:340px; max-height:288px; overflow-y:auto; padding:6px; background:var(--ae-card); border:1px solid var(--ae-border); border-radius:10px; box-shadow:var(--ae-shadow); visibility:hidden; opacity:0; transform:translateY(-8px) scale(.95); transform-origin:top left; pointer-events:none; will-change:opacity,transform; transition:opacity .15s cubic-bezier(.4,0,1,1), transform .18s cubic-bezier(.4,0,1,1), visibility 0s linear .18s; }
 .ae-select-menu.align-right { left:auto; right:0; transform-origin:top right; }
 .ae-select.open .ae-select-menu { visibility:visible; opacity:1; transform:none; pointer-events:auto; transition:opacity .16s ease-out, transform .28s cubic-bezier(.16,1,.3,1), visibility 0s; }
 .ae-select.open .ae-opt { animation:aeOptIn .26s cubic-bezier(.16,1,.3,1) both; animation-delay:calc(min(var(--i,0),9) * 16ms); }
 @keyframes aeOptIn { from { opacity:0; transform:translateY(-5px); } to { opacity:1; transform:none; } }
 @media (prefers-reduced-motion:reduce) { .ae-select-menu, .dl-menu, .ae-select-chev { transition-duration:.01s !important; } .ae-select.open .ae-opt { animation:none; } }
 .ae-opt { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:9px 10px; border-radius:6px; font-size:13px; color:var(--ae-text); cursor:pointer; white-space:nowrap; }
-.ae-opt.selected { color:#fff; font-weight:600; }
+.ae-opt.selected { color:var(--ae-strong); font-weight:600; }
 .ae-opt.active { background:var(--ae-accent); color:#fff; }
-.ae-opt svg { flex:none; visibility:hidden; color:#8b95ff; }
+.ae-opt svg { flex:none; visibility:hidden; color:var(--ae-link); }
 .ae-opt.selected svg { visibility:visible; }
 .ae-opt.active svg { color:#fff; }
-.ae-tbtn { height:32px; border:0; border-radius:6px; padding:0 12px; background:#2b2d31; color:var(--ae-text); cursor:pointer; font-size:12px; font-weight:500; transition:.15s; }
-.ae-tbtn:hover { background:#35373c; color:#fff; }
-.ae-status { display:none; position:relative; height:26px; background:#17181a; border-bottom:1px solid var(--ae-border); font-size:12px; color:var(--ae-text); }
+.ae-tbtn { height:32px; border:0; border-radius:6px; padding:0 12px; background:var(--ae-btn); color:var(--ae-text); cursor:pointer; font-size:12px; font-weight:500; transition:.15s; }
+.ae-tbtn:hover { background:var(--ae-btn-hover); color:var(--ae-strong); }
+.ae-status { display:none; position:relative; height:26px; background:var(--ae-bg2); border-bottom:1px solid var(--ae-border); font-size:12px; color:var(--ae-text); }
 .ae-status.on { display:block; }
-.ae-status-fill { position:absolute; left:0; top:0; bottom:0; width:0; background:rgba(88,101,242,.35); transition:width .15s; }
+.ae-status-fill { position:absolute; left:0; top:0; bottom:0; width:0; background:color-mix(in srgb,var(--ae-accent) 35%,transparent); transition:width .15s; }
 .ae-status span { position:relative; line-height:26px; padding:0 18px; }
-.ae-body { flex:1; overflow-y:auto; padding:16px; background:#141517; }
+.ae-body { flex:1; overflow-y:auto; padding:16px; background:var(--ae-bg2); }
 .ae-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:14px; }
-.ae-card { background:var(--ae-card); border:1px solid var(--ae-border); border-radius:10px; overflow:hidden; transition:border-color .2s; display:flex; flex-direction:column; }
+.ae-card { content-visibility:auto; contain-intrinsic-size:auto 330px; background:var(--ae-card); border:1px solid var(--ae-border); border-radius:10px; overflow:hidden; transition:border-color .2s; display:flex; flex-direction:column; }
 .ae-card:hover { border-color:var(--ae-card-hover); }
 .ae-card.ae-selected { border-color:var(--ae-accent); box-shadow:0 0 0 1px var(--ae-accent); }
-.ae-preview { height:150px; background:repeating-conic-gradient(#17181a 0% 25%,#1b1c1f 0% 50%) 50%/20px 20px; display:flex; align-items:center; justify-content:center; overflow:hidden; position:relative; }
+.ae-preview { height:150px; background:repeating-conic-gradient(var(--ae-bg2) 0% 25%,var(--ae-bg) 0% 50%) 50%/20px 20px; display:flex; align-items:center; justify-content:center; overflow:hidden; position:relative; }
 .ae-preview img, .ae-preview video { max-width:100%; max-height:100%; object-fit:contain; }
 .ae-video { position:relative; width:100%; height:100%; background:#000; user-select:none; }
 .ae-video video { width:100%; height:100%; max-width:none; max-height:none; object-fit:contain; display:block; cursor:pointer; }
-.ae-vbig { position:absolute; left:50%; top:calc(50% - 16px); transform:translate(-50%,-50%); width:44px; height:44px; padding:0; border:0; border-radius:50%; background:rgba(0,0,0,.6); color:#fff; display:grid; place-items:center; cursor:pointer; backdrop-filter:blur(4px); transition:transform .1s, background-color .1s, opacity .15s; }
+.ae-vbig { position:absolute; left:50%; top:calc(50% - 16px); transform:translate(-50%,-50%); width:44px; height:44px; padding:0; border:0; border-radius:50%; background:rgba(0,0,0,.6); color:#fff; display:grid; place-items:center; cursor:pointer; transition:transform .1s, background-color .1s, opacity .15s; }
 .ae-vbig:hover { background:rgba(0,0,0,.8); transform:translate(-50%,-50%) scale(1.08); }
 .ae-video.playing .ae-vbig, .ae-video.ended .ae-vbig { opacity:0; pointer-events:none; }
-.ae-vbar { position:absolute; left:0; right:0; bottom:0; height:32px; display:flex; align-items:center; gap:6px; padding:0 6px; background:rgba(0,0,0,.45); backdrop-filter:blur(2px); color:#fff; z-index:3; }
+.ae-vbar { position:absolute; left:0; right:0; bottom:0; height:32px; display:flex; align-items:center; gap:6px; padding:0 6px; background:rgba(0,0,0,.55); color:#fff; z-index:3; }
 .ae-vbtn { flex:none; width:24px; height:24px; padding:0; border:0; background:transparent; color:#fff; display:grid; place-items:center; cursor:pointer; border-radius:4px; opacity:.9; transition:opacity .1s, background-color .1s; }
 .ae-vbtn:hover { opacity:1; background:rgba(255,255,255,.15); }
 .ae-vbtn svg { display:block; }
@@ -506,27 +682,27 @@
 .ae-video.ae-idle .ae-vbar { opacity:0; pointer-events:none; }
 .ae-video.ae-idle, .ae-video.ae-idle video { cursor:none; }
 .ae-preview img { cursor:zoom-in; }
-.ae-audio { display:flex; align-items:center; gap:8px; width:calc(100% - 16px); height:48px; padding:0 10px 0 8px; background:#2b2d31; border-radius:24px; box-shadow:0 0 0 1px rgba(255,255,255,.05), 0 2px 8px rgba(0,0,0,.35); user-select:none; }
+.ae-audio { display:flex; align-items:center; gap:8px; width:calc(100% - 16px); height:48px; padding:0 10px 0 8px; background:var(--ae-btn); border-radius:24px; box-shadow:0 0 0 1px var(--ae-border), 0 2px 8px rgba(0,0,0,.2); user-select:none; }
 .ae-audio audio { display:none; }
 .ae-play { flex:none; width:32px; height:32px; padding:0; border:0; border-radius:50%; background:var(--ae-accent); color:#fff; display:grid; place-items:center; cursor:pointer; transition:background-color .1s, transform .1s; }
-.ae-play:hover { background:#4752c4; }
+.ae-play:hover { background:var(--ae-accent-hover); }
 .ae-play:active { transform:scale(.93); }
 .ae-play svg { display:block; }
 .ae-audio .i-pause, .ae-audio.playing .i-play { display:none; }
 .ae-audio.playing .i-pause { display:block; }
 .ae-wave { flex:1; min-width:0; height:32px; display:block; cursor:pointer; touch-action:none; }
-.ae-atime { flex:none; min-width:28px; text-align:right; font-size:12px; font-weight:500; font-variant-numeric:tabular-nums; color:#b5bac1; }
-.ae-vol { flex:none; width:20px; height:20px; padding:0; border:0; background:transparent; color:#b5bac1; display:grid; place-items:center; cursor:pointer; transition:color .1s; }
-.ae-vol:hover { color:#fff; }
+.ae-atime { flex:none; min-width:28px; text-align:right; font-size:12px; font-weight:500; font-variant-numeric:tabular-nums; color:var(--ae-ico); }
+.ae-vol { flex:none; width:20px; height:20px; padding:0; border:0; background:transparent; color:var(--ae-ico); display:grid; place-items:center; cursor:pointer; transition:color .1s; }
+.ae-vol:hover { color:var(--ae-strong); }
 .ae-vol svg { display:block; }
 .ae-audio .i-mute, .ae-audio.muted .i-vol { display:none; }
 .ae-audio.muted .i-mute { display:block; }
-.ae-audio.ae-aerr .ae-atime { color:#f23f43; }
+.ae-audio.ae-aerr .ae-atime { color:var(--ae-neg); }
 .ae-icon { font-size:24px; color:var(--ae-muted); font-weight:bold; }
 .ae-measure { width:270px; }
-.ae-tbtn.ae-regex { min-width:36px; font-family:Consolas,monospace; font-weight:700; }
+.ae-tbtn.ae-regex { min-width:36px; font-family:var(--font-code,Consolas,monospace); font-weight:700; }
 .ae-tbtn.on, .ae-tbtn.on:hover { background:var(--ae-accent); color:#fff; }
-.ae-input.ae-bad { border-color:#f23f43; }
+.ae-input.ae-bad { border-color:var(--ae-neg); }
 .ae-font { width:100%; height:100%; padding:10px 14px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; text-align:center; font-family:serif; color:var(--ae-text); opacity:.45; transition:opacity .2s; overflow:hidden; }
 .ae-font.ready { opacity:1; }
 .ae-font-big { font-size:46px; line-height:1; white-space:nowrap; }
@@ -534,27 +710,29 @@
 .ae-font-digits { font-size:12px; opacity:.75; white-space:nowrap; }
 .ae-font.err { opacity:1; }
 .ae-font.err .ae-font-line, .ae-font.err .ae-font-digits { display:none; }
-.ae-font.err::after { content:'Preview unavailable'; font:11px Arial,sans-serif; color:var(--ae-muted); }
-.ae-check { position:absolute; top:8px; left:8px; z-index:2; width:24px; height:24px; background:rgba(17,18,20,.6); backdrop-filter:blur(4px); border-radius:7px; display:grid; place-items:center; cursor:pointer; opacity:.55; transition:opacity .15s, background .15s; }
+.ae-font.err::after { content:'Preview unavailable'; font:11px var(--font-primary,Arial,sans-serif); color:var(--ae-muted); }
+.ae-check { position:absolute; top:8px; left:8px; z-index:2; width:24px; height:24px; background:color-mix(in srgb,var(--ae-bg) 80%,transparent); border-radius:7px; display:grid; place-items:center; cursor:pointer; opacity:.55; transition:opacity .15s, background .15s; }
 .ae-card:hover .ae-check, .ae-card.ae-selected .ae-check { opacity:1; }
-.ae-check input { appearance:none; -webkit-appearance:none; width:16px; height:16px; margin:0; cursor:pointer; border:2px solid #b5bac1; border-radius:5px; background:transparent center/12px no-repeat; transition:background-color .15s, border-color .15s, transform .1s; }
-.ae-check:hover input { border-color:#fff; }
+.ae-check input { appearance:none; -webkit-appearance:none; width:16px; height:16px; margin:0; cursor:pointer; border:2px solid var(--ae-ico); border-radius:5px; background:transparent center/12px no-repeat; transition:background-color .15s, border-color .15s, transform .1s; }
+.ae-check:hover input { border-color:var(--ae-strong); }
 .ae-check input:active { transform:scale(.88); }
 .ae-check input:checked { background-color:var(--ae-accent); border-color:var(--ae-accent); background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.4l2.3 2.3 4.7-5' fill='none' stroke='white' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
 .ae-card-body { padding:12px; flex:1; display:flex; flex-direction:column; }
-.ae-type { align-self:flex-start; padding:3px 8px; border-radius:4px; background:rgba(88,101,242,.15); color:#aeb5ff; font-size:10px; text-transform:uppercase; font-weight:bold; }
-.ae-name { margin-top:8px; font-family:Consolas,monospace; font-size:12px; color:var(--ae-text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.ae-dim { margin-top:4px; font-size:11px; color:#aeb5ff; font-family:Consolas,monospace; }
-.ae-meta { margin-top:auto; padding-top:8px; font-size:11px; color:#80848e; line-height:1.5; }
+.ae-type { align-self:flex-start; padding:3px 8px; border-radius:4px; background:color-mix(in srgb,var(--ae-accent) 15%,transparent); color:var(--ae-accent); font-size:10px; text-transform:uppercase; font-weight:bold; }
+.ae-name { margin-top:8px; font-family:var(--font-code,Consolas,monospace); font-size:12px; color:var(--ae-text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ae-dim { margin-top:4px; font-size:11px; color:var(--ae-accent); font-family:var(--font-code,Consolas,monospace); }
+.ae-meta { margin-top:auto; padding-top:8px; font-size:11px; color:var(--ae-subtle); line-height:1.5; }
 .ae-actions { display:flex; gap:6px; margin-top:10px; }
-.ae-btn { flex:1; border:0; border-radius:6px; height:32px; color:var(--ae-text); background:#2b2d31; cursor:pointer; font-size:12px; font-weight:500; transition:.15s; }
-.ae-btn:hover { background:#35373c; color:#fff; }
+.ae-btn { flex:1; border:0; border-radius:6px; height:32px; color:var(--ae-text); background:var(--ae-btn); cursor:pointer; font-size:12px; font-weight:500; transition:.15s; }
+.ae-btn:hover { background:var(--ae-btn-hover); color:var(--ae-strong); }
 .ae-btn-primary { background:var(--ae-accent); color:#fff; margin:20px auto 10px; display:block; padding:10px 24px; flex:none; }
-.ae-btn-primary:hover { background:#4752c4; }
+.ae-btn-primary:hover { background:var(--ae-accent-hover); color:#fff; }
 .dl-wrap { position:relative; }
 .dl-btn { height:32px; border:0; border-radius:3px; padding:0 16px; background:var(--ae-accent); color:#fff; font-weight:500; font-size:14px; box-shadow:none; cursor:pointer; display:flex; align-items:center; gap:6px; transition:background-color .1s ease; }
-.dl-btn:hover { background:#4752c4; }
-.dl-menu { position:absolute; right:0; top:42px; width:260px; background:#1e1f22; border:1px solid var(--ae-border); border-radius:10px; box-shadow:var(--ae-shadow); padding:6px; z-index:10; visibility:hidden; opacity:0; transform:translateY(-8px) scale(.95); transform-origin:top right; pointer-events:none; will-change:opacity,transform; transition:opacity .15s cubic-bezier(.4,0,1,1), transform .18s cubic-bezier(.4,0,1,1), visibility 0s linear .18s; }
+.dl-btn:hover { background:var(--ae-accent-hover); }
+.ae-scan { background:var(--ae-accent); }
+.ae-scan:hover { background:var(--ae-accent-hover); }
+.dl-menu { position:absolute; right:0; top:42px; width:260px; background:var(--ae-card); border:1px solid var(--ae-border); border-radius:10px; box-shadow:var(--ae-shadow); padding:6px; z-index:10; visibility:hidden; opacity:0; transform:translateY(-8px) scale(.95); transform-origin:top right; pointer-events:none; will-change:opacity,transform; transition:opacity .15s cubic-bezier(.4,0,1,1), transform .18s cubic-bezier(.4,0,1,1), visibility 0s linear .18s; }
 .dl-menu.open { visibility:visible; opacity:1; transform:none; pointer-events:auto; transition:opacity .16s ease-out, transform .28s cubic-bezier(.16,1,.3,1), visibility 0s; }
 .dl-menu-item { width:100%; text-align:left; border:0; background:transparent; color:var(--ae-text); padding:9px 10px; border-radius:6px; cursor:pointer; font-size:13px; display:flex; justify-content:space-between; }
 .dl-menu-item:hover { background:var(--ae-accent); color:#fff; }
@@ -568,42 +746,13 @@
 .ae-tip.top .ae-tip-caret { top:calc(100% - 1.4px); }
 .ae-tip.bottom .ae-tip-caret { bottom:calc(100% - 1.4px); transform:scaleY(-1); }
 .ae-tip-fill { fill:var(--ae-tip-bg); stroke:none; }
-.ae-tip-stroke { fill:none; stroke:var(--ae-tip-border); stroke-width:2; stroke-linejoin:round; }
-#__asset_explorer__[data-ae-theme="light"] { color-scheme:light; --ae-bg:#ffffff; --ae-card:#ffffff; --ae-card-hover:rgba(88,101,242,.55); --ae-text:#313338; --ae-muted:#5c5e66; --ae-border:rgba(0,0,0,.1); --ae-shadow:0 12px 48px rgba(0,0,0,.22); }
-#__asset_explorer__[data-ae-theme="dark"] { color-scheme:dark; }
-#__asset_explorer__[data-ae-theme="light"] ::-webkit-scrollbar-thumb { background:#c4c9ce; }
-#__asset_explorer__[data-ae-theme="light"] .ae-backdrop { background:rgba(0,0,0,.5); }
-#__asset_explorer__[data-ae-theme="light"] .ae-heading h2 { color:#060607; }
-#__asset_explorer__[data-ae-theme="light"] .ae-close:hover { color:#060607; }
-#__asset_explorer__[data-ae-theme="light"] .ae-toolbar { background:#f2f3f5; }
-#__asset_explorer__[data-ae-theme="light"] .ae-input { border-color:rgba(0,0,0,.14); }
-#__asset_explorer__[data-ae-theme="light"] .ae-select-btn:hover { border-color:rgba(0,0,0,.28); }
-#__asset_explorer__[data-ae-theme="light"] .ae-select.open .ae-select-chev { color:#060607; }
-#__asset_explorer__[data-ae-theme="light"] .ae-select-menu, #__asset_explorer__[data-ae-theme="light"] .dl-menu { background:#ffffff; }
-#__asset_explorer__[data-ae-theme="light"] .ae-opt.selected { color:#060607; }
-#__asset_explorer__[data-ae-theme="light"] .ae-opt.active { color:#fff; }
-#__asset_explorer__[data-ae-theme="light"] .ae-tbtn, #__asset_explorer__[data-ae-theme="light"] .ae-btn:not(.ae-btn-primary) { background:#e3e5e8; }
-#__asset_explorer__[data-ae-theme="light"] .ae-tbtn:hover, #__asset_explorer__[data-ae-theme="light"] .ae-btn:not(.ae-btn-primary):hover { background:#d7d9dc; color:#060607; }
-#__asset_explorer__[data-ae-theme="light"] .ae-status { background:#f2f3f5; }
-#__asset_explorer__[data-ae-theme="light"] .ae-tbtn.on, #__asset_explorer__[data-ae-theme="light"] .ae-tbtn.on:hover { background:var(--ae-accent); color:#fff; }
-#__asset_explorer__[data-ae-theme="light"] .ae-body { background:#f2f3f5; }
-#__asset_explorer__[data-ae-theme="light"] .ae-preview { background:repeating-conic-gradient(#e3e5e8 0% 25%,#eceef0 0% 50%) 50%/20px 20px; }
-#__asset_explorer__[data-ae-theme="light"] .ae-audio { background:#e3e5e8; box-shadow:0 0 0 1px rgba(0,0,0,.06), 0 2px 8px rgba(0,0,0,.12); }
-#__asset_explorer__[data-ae-theme="light"] .ae-atime, #__asset_explorer__[data-ae-theme="light"] .ae-vol { color:#4e5058; }
-#__asset_explorer__[data-ae-theme="light"] .ae-vol:hover { color:#060607; }
-#__asset_explorer__[data-ae-theme="light"] .ae-audio.ae-aerr .ae-atime { color:#d83c3e; }
-#__asset_explorer__[data-ae-theme="light"] .ae-check { background:rgba(255,255,255,.8); }
-#__asset_explorer__[data-ae-theme="light"] .ae-check input:not(:checked) { border-color:#80848e; }
-#__asset_explorer__[data-ae-theme="light"] .ae-check:hover input:not(:checked) { border-color:#060607; }
-#__asset_explorer__[data-ae-theme="light"] .ae-type { color:#4752c4; }
-#__asset_explorer__[data-ae-theme="light"] .ae-dim { color:#4752c4; }
-#__asset_explorer__[data-ae-theme="light"] .ae-meta { color:#5c5e66; }
+.ae-tip-stroke { fill:none; stroke:var(--ae-tip-border); stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
 </style>
 <div class="ae-backdrop"><div class="ae-modal">
   <div class="ae-header">
-    <div class="ae-heading"><h2>Discord Asset Explorer</h2></div>
+    <div class="ae-heading"><h2>Discord Asset Explorer - By _Dr1zzyx_</h2></div>
     <div class="dl-wrap">
-      <button class="dl-btn" data-act="dl-toggle" title="Download assets">⬇ Download</button>
+      <button class="dl-btn" data-act="dl-toggle" title="Download assets">⇩ Download</button>
       <div class="dl-menu">
         <button class="dl-menu-item" data-act="dl-sel-files">Selected, separate files <small class="dl-n-sel"></small></button>
         <button class="dl-menu-item" data-act="dl-sel-zip">Selected, one ZIP <small class="dl-n-sel"></small></button>
@@ -639,7 +788,7 @@
     <button class="ae-tbtn" data-act="selall">Select all filtered</button>
     <button class="ae-tbtn" data-act="clear">Clear selection</button>
     <button class="ae-tbtn" data-act="copysel">Copy selected</button>
-    <button class="ae-tbtn" data-act="scan" title="Loads Discord's async webpack chunks to find more assets">Scan lazy chunks</button>
+    <button class="ae-tbtn ae-scan" data-act="scan" title="Loads Discord's async webpack chunks to find more assets">Get more assets (lazy chunks)</button>
   </div>
   <div class="ae-status"><div class="ae-status-fill"></div><span></span></div>
   <div class="ae-body"><div class="ae-grid"></div><button class="ae-btn ae-btn-primary ae-load-more" style="display:none">Load More</button></div>
@@ -649,6 +798,9 @@
 		cacheDOM() {
 			const q = s => this.root.querySelector(s);
 			this.$grid = q(".ae-grid");
+			this.$body = q(".ae-body");
+			this.$nSel = this.root.querySelectorAll(".dl-n-sel");
+			this.$nFlt = this.root.querySelectorAll(".dl-n-flt");
 			this.$search = q(".ae-search");
 			this.$filter = q(".ae-filter");
 			this.$source = q(".ae-source");
@@ -915,36 +1067,34 @@
 			);
 			this.$loadMore.addEventListener("click", () => {
 				this.visibleCount += this.pageSize;
-				this.updateGrid();
+				this.updateGrid(true);
 			});
 
 			this.$grid.addEventListener("click", e => {
 				const img = e.target.closest(".ae-preview img");
 				if (img) return this.openLightbox(img.getAttribute("src"));
 				const btn = e.target.closest(".ae-btn");
-				if (!btn) return;
-				if (btn.dataset.copy) {
-					this.copyText(this.formatCopy(btn.dataset.copy)).then(() => {
-						const original = btn.textContent;
+				const url = btn?.closest(".ae-card")?.dataset.url;
+				if (!url) return;
+				const act = btn.dataset.a;
+				if (act === "copy") {
+					this.copyText(this.formatCopy(url)).then(() => {
 						btn.textContent = "Copied!";
 						btn.style.background = "#23a559";
 						setTimeout(() => {
-							btn.textContent = original;
+							btn.textContent = "Copy";
 							btn.style.background = "";
 						}, 1500);
 					});
-				} else if (btn.dataset.open) {
-					window.open(btn.dataset.open, "_blank", "noopener,noreferrer");
-				} else if (btn.dataset.dl) {
-					this.downloadOne(btn.dataset.dl);
-				}
+				} else if (act === "open") window.open(url, "_blank", "noopener,noreferrer");
+				else if (act === "dl") this.downloadOne(url);
 			});
 			this.$grid.addEventListener("change", e => {
-				const cb = e.target.closest("input[data-sel]");
+				const cb = e.target.closest(".ae-check input");
 				if (!cb) return;
-				const url = cb.dataset.sel;
-				cb.checked ? this.selected.add(url) : this.selected.delete(url);
-				cb.closest(".ae-card").classList.toggle("ae-selected", cb.checked);
+				const card = cb.closest(".ae-card");
+				cb.checked ? this.selected.add(card.dataset.url) : this.selected.delete(card.dataset.url);
+				card.classList.toggle("ae-selected", cb.checked);
 				this.updateInfo();
 			});
 			this.$grid.addEventListener(
@@ -1082,18 +1232,20 @@
 		}
 
 		pumpSizes() {
-			while (this.sizeActive < (this.sizeLimit || 4) && this.sizeQueue.length) {
-				const url = this.sizeQueue.shift();
+			while (!this.destroyed && this.sizeActive < this.sizeLimit && this.sizeQueue.length) {
+				const url = this.sizeQueue.pop();
+				const m = this.getMeta(url);
 				this.sizeActive++;
-				fetch(url, { method: "HEAD" })
+				fetch(url, { method: "HEAD", signal: this.ac.signal })
 					.then(r => {
 						const len = r.headers.get("content-length");
-						if (len != null) this.getMeta(url).size = Number(len);
+						if (len != null) m.size = Number(len);
 					})
 					.catch(() => {})
 					.finally(() => {
 						this.sizeActive--;
-						this.getMeta(url).sizeDone = true;
+						if (this.destroyed) return void (m.sizeTried = false);
+						m.sizeDone = true;
 						this.paintMeta(url);
 						this.pumpSizes();
 						this.scheduleMeasure();
@@ -1104,63 +1256,20 @@
 		getPreviewHTML(asset) {
 			const url = escapeHTML(asset.url);
 			const ext = asset.extension;
-			if (EXTENSIONS.images.has(ext)) return '<img src="' + url + '" loading="lazy" referrerpolicy="no-referrer" alt="' + escapeHTML(asset.name) + '">';
+
+			if (EXTENSIONS.images.has(ext))
+				return `<img src="${url}" loading="lazy" decoding="async" referrerpolicy="no-referrer" alt="${escapeHTML(asset.name)}">`;
+
 			if (EXTENSIONS.videos.has(ext))
-				return (
-					'<div class="ae-video">' +
-					'<video src="' +
-					url +
-					'" preload="metadata" playsinline></video>' +
-					'<button class="ae-vbig" type="button" data-v="play" title="Play">' +
-					ICON_PLAY.replace(/width="18" height="18"/, 'width="24" height="24"') +
-					"</button>" +
-					'<div class="ae-vbar">' +
-					'<button class="ae-vbtn" type="button" data-v="play" title="Play / Pause">' +
-					ICON_PLAY +
-					ICON_PAUSE +
-					ICON_REPLAY +
-					"</button>" +
-					'<span class="ae-vtime">0:00</span>' +
-					'<div class="ae-vprog" data-v="seek"><div class="ae-vtrack"><div class="ae-vfill"></div></div></div>' +
-					'<button class="ae-vbtn" type="button" data-v="mute" title="Mute">' +
-					ICON_VOL +
-					ICON_MUTE +
-					"</button>" +
-					'<button class="ae-vbtn" type="button" data-v="fs" title="Fullscreen">' +
-					ICON_FS +
-					"</button>" +
-					"</div></div>"
-				);
+				return `<div class="ae-video"><video data-lazy="1" data-src="${url}" preload="metadata" playsinline></video><button class="ae-vbig" type="button" data-v="play" title="Play">${ICON_PLAY.replace(/width="18" height="18"/, 'width="24" height="24"')}</button><div class="ae-vbar"><button class="ae-vbtn" type="button" data-v="play" title="Play / Pause">${ICON_PLAY}${ICON_PAUSE}${ICON_REPLAY}</button><span class="ae-vtime">0:00</span><div class="ae-vprog" data-v="seek"><div class="ae-vtrack"><div class="ae-vfill"></div></div></div><button class="ae-vbtn" type="button" data-v="mute" title="Mute">${ICON_VOL}${ICON_MUTE}</button><button class="ae-vbtn" type="button" data-v="fs" title="Fullscreen">${ICON_FS}</button></div></div>`;
+
 			if (EXTENSIONS.audios.has(ext))
-				return (
-					'<div class="ae-audio" data-audio="' +
-					url +
-					'">' +
-					'<button class="ae-play" type="button">' +
-					ICON_PLAY +
-					ICON_PAUSE +
-					"</button>" +
-					'<canvas class="ae-wave"></canvas>' +
-					'<span class="ae-atime">0:00</span>' +
-					'<button class="ae-vol" type="button">' +
-					ICON_VOL +
-					ICON_MUTE +
-					"</button>" +
-					'<audio src="' +
-					url +
-					'" preload="none"></audio></div>'
-				);
+				return `<div class="ae-audio" data-audio="${url}"><button class="ae-play" type="button">${ICON_PLAY}${ICON_PAUSE}</button><canvas class="ae-wave"></canvas><span class="ae-atime">0:00</span><button class="ae-vol" type="button">${ICON_VOL}${ICON_MUTE}</button><audio src="${url}" preload="none"></audio></div>`;
+
 			if (EXTENSIONS.fonts.has(ext))
-				return (
-					'<div class="ae-font" data-font="' +
-					url +
-					'">' +
-					'<div class="ae-font-big">Aa Gg</div>' +
-					'<div class="ae-font-line">The quick brown fox jumps over the lazy dog</div>' +
-					'<div class="ae-font-digits">0123456789 !?&amp;@#</div>' +
-					"</div>"
-				);
-			return '<div class="ae-icon">.' + escapeHTML(ext || "?") + "</div>";
+				return `<div class="ae-font" data-font="${url}"><div class="ae-font-big">Aa Gg</div><div class="ae-font-line">The quick brown fox jumps over the lazy dog</div><div class="ae-font-digits">0123456789 !?&amp;@#</div></div>`;
+
+			return `<div class="ae-icon">.${escapeHTML(ext || "?")}</div>`;
 		}
 
 		playerOf(node) {
@@ -1194,7 +1303,7 @@
 			if (typeof st.search === "string" && st.search) this.$search.value = st.search;
 			if (st.regex === true) this.$regex.click();
 			this.selects?.forEach(sl => this.refreshSelect(sl));
-			const save = () => this.saveSettings();
+			const save = e => e?.target?.type !== "checkbox" && this.saveSettings();
 			this.root.addEventListener("change", save);
 			this.$sortDir.addEventListener("click", save);
 			this.$regex.addEventListener("click", save);
@@ -1324,21 +1433,24 @@
 		}
 
 		pumpDims() {
-			while (this.dimActive < 8 && this.dimQueue.length) {
-				const url = this.dimQueue.shift();
-				this.dimActive++;
+			while (!this.destroyed && this.dimActive < 8 && this.dimQueue.length) {
+				const url = this.dimQueue.pop();
 				const img = new Image();
 				img.referrerPolicy = "no-referrer";
+				img.decoding = "async";
+				this._imgs.set(img, url);
+				this.dimActive++;
 				const done = ok => {
 					img.onload = img.onerror = null;
+					this._imgs.delete(img);
+					this.dimActive--;
 					const m = this.getMeta(url);
+					if (this.destroyed) return void (m.dimTried = false);
 					if (ok && m.w == null) {
 						m.w = img.naturalWidth;
 						m.h = img.naturalHeight;
 					}
 					m.dimDone = true;
-					this.dimActive--;
-					if (this.destroyed) return;
 					this.paintMeta(url);
 					this.pumpDims();
 					this.scheduleMeasure();
@@ -1361,22 +1473,20 @@
 			}, 400);
 		}
 
-		initFonts() {
-			const els = this.$grid.querySelectorAll(".ae-font");
-			if (!els.length) return;
-			if (!this.fontIO) {
-				this.fontIO = new IntersectionObserver(
-					entries => {
-						entries.forEach(en => {
-							if (!en.isIntersecting) return;
-							this.fontIO.unobserve(en.target);
-							this.loadFont(en.target);
-						});
-					},
-					{ rootMargin: "200px" }
-				);
-			}
-			els.forEach(el => this.fontIO.observe(el));
+		lazy(el) {
+			this.lazyIO ||= new IntersectionObserver(
+				es => {
+					for (const en of es) {
+						if (!en.isIntersecting) continue;
+						const t = en.target;
+						this.lazyIO.unobserve(t);
+						if (t.dataset.font) this.loadFont(t);
+						else t.src = t.dataset.src;
+					}
+				},
+				{ root: this.$body, rootMargin: "300px" }
+			);
+			this.lazyIO.observe(el);
 		}
 
 		loadFont(el) {
@@ -1407,24 +1517,17 @@
 			});
 		}
 
-		teardownFonts() {
-			this.fontIO?.disconnect();
-		}
-
-		teardownAudio() {
+		teardownMedia() {
 			this.audioIO?.disconnect();
 			this.audioRO?.disconnect();
+			this.lazyIO?.disconnect();
 			this.peakQueue = [];
-			this.$grid.querySelectorAll(".ae-audio").forEach(el => {
-				const p = el._dzp;
-				if (p) cancelAnimationFrame(p.raf);
-				const a = el.querySelector("audio");
-				if (a) {
-					a.pause();
-					a.removeAttribute("src");
-					a.load();
-				}
-			});
+			for (const el of this.$grid.querySelectorAll(".ae-audio")) cancelAnimationFrame(el._dzp?.raf);
+			for (const el of this.$grid.querySelectorAll("audio,video")) {
+				el.pause();
+				el.removeAttribute("src");
+				el.load();
+			}
 		}
 
 		initPlayer(el) {
@@ -1501,12 +1604,13 @@
 			const N = 128;
 			let result;
 			try {
-				const res = await fetch(url);
+				const res = await fetch(url, { signal: this.ac.signal });
 				if (!res.ok) throw new Error("http " + res.status);
+				if (+res.headers.get("content-length") > 10485760) throw new Error("too large");
 				const buf = await res.arrayBuffer();
-				if (buf.byteLength > 25 * 1024 * 1024) throw new Error("too large");
+				if (buf.byteLength > 10485760) throw new Error("too large");
 				const Ctx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-				const audio = await new Promise((ok, no) => new Ctx(1, 1, 44100).decodeAudioData(buf, ok, no));
+				const audio = await (this.actx ||= new Ctx(1, 1, 44100)).decodeAudioData(buf);
 				const chans = Array.from({ length: audio.numberOfChannels }, (_, i) => audio.getChannelData(i));
 				const len = audio.length;
 				const size = Math.max(1, Math.floor(len / N));
@@ -1611,7 +1715,7 @@
 			const grid = this.$grid;
 			const vidOf = n => n.closest(".ae-video");
 			const paint = v => {
-				const w = v.parentNode.closest ? v.closest(".ae-video") : null;
+				const w = v.closest(".ae-video");
 				if (!w) return;
 				const d = v.duration;
 				const t = v.currentTime;
@@ -1621,6 +1725,7 @@
 				if (te) te.textContent = Number.isFinite(d) && d > 0 ? fmtTime(t) + " / " + fmtTime(d) : fmtTime(t);
 			};
 			const toggle = v => {
+				if (!v.getAttribute("src")) v.src = v.dataset.src;
 				if (v.ended) v.currentTime = 0;
 				v.paused || v.ended ? v.play().catch(() => {}) : v.pause();
 			};
@@ -1675,9 +1780,7 @@
 				const w = vidOf(e.target);
 				if (w && isFs(w)) wake(w);
 			});
-			document.addEventListener("fullscreenchange", () => {
-				grid.querySelectorAll(".ae-video").forEach(w => wake(w));
-			});
+			document.addEventListener("fullscreenchange", (this._fsChange = () => grid.querySelectorAll(".ae-video").forEach(w => wake(w))));
 			on("play", (v, w) => {
 				w.classList.remove("ended");
 				w.classList.add("playing");
@@ -1770,102 +1873,93 @@
 		}
 
 		getFiltered() {
-			const query = this.$search.value.trim().toLowerCase();
+			const q = this.$search.value.trim().toLowerCase();
 			const ext = this.$filter.value;
 			const src = this.$source.value;
-			const status = this.$statusFilter.value;
-			let list = this.assetList.filter(a => {
+			const onlySel = this.$statusFilter.value === "selected";
+			const rx = this.regexOn;
+			let list = this.rows.filter(a => {
 				if (ext && a.extension !== ext) return false;
-				if (src && !a.sources.some(s => s.split(":")[0] === src)) return false;
-				if (status === "selected" && !this.selected.has(a.url)) return false;
-				if (!query) return true;
-				if (this.regexOn) return this.regex ? this.regex.test(fileOf(a.url)) : true;
-				return (a.url + " " + a.extension + " " + a.modules.join(" ") + " " + a.sources.join(" ")).toLowerCase().includes(query);
+				if (src && !a._s.has(src)) return false;
+				if (onlySel && !this.selected.has(a.url)) return false;
+				if (!q) return true;
+				if (rx) return this.regex ? this.regex.test(a.name) : true;
+				return a._h.includes(q);
 			});
 			this._mPending = 0;
 			if (this.measureRules) list = list.filter(a => this.measureMatch(a));
 			const k = this.sortKey;
 			const d = this.sortDir;
-			const name = a => fileOf(a.url).toLowerCase();
+			const C = COLL.compare;
 			list.sort((a, b) => {
 				let c;
-				if (k === "name") c = name(a).localeCompare(name(b));
+				if (k === "name") c = C(a._l, b._l);
 				else if (k === "modules") c = a.modules.length - b.modules.length;
-				else if (k === "source") c = (a.sources[0] || "").localeCompare(b.sources[0] || "");
-				else c = a.extension.localeCompare(b.extension);
-				return c * d || a.url.localeCompare(b.url);
+				else if (k === "source") c = C(a.sources[0] || "", b.sources[0] || "");
+				else c = C(a.extension, b.extension);
+				return c * d || C(a.url, b.url);
 			});
 			return list;
 		}
 
-		updateGrid() {
-			this.filtered = this.getFiltered();
-			const visible = this.filtered.slice(0, this.visibleCount);
-			this.teardownAudio();
-			this.teardownFonts();
-			this.$grid.innerHTML = visible
-				.map(asset => {
-					const url = escapeHTML(asset.url);
-					const modules = asset.modules.length ? asset.modules.slice(0, 3).join(", ") + (asset.modules.length > 3 ? "..." : "") : "N/A";
-					const sel = this.selected.has(asset.url);
-					const check = '<label class="ae-check"><input type="checkbox" data-sel="' + url + '"' + (sel ? " checked" : "") + "></label>";
-					return (
-						'<div class="ae-card' +
-						(sel ? " ae-selected" : "") +
-						'" data-url="' +
-						url +
-						'">' +
-						'<div class="ae-preview">' +
-						check +
-						this.getPreviewHTML(asset) +
-						"</div>" +
-						'<div class="ae-card-body"><span class="ae-type">' +
-						escapeHTML(asset.extension || "unknown") +
-						"</span>" +
-						'<div class="ae-name" title="' +
-						url +
-						'">' +
-						escapeHTML(fileOf(asset.url)) +
-						"</div>" +
-						'<div class="ae-dim" data-meta="' +
-						url +
-						'">...</div>' +
-						'<div class="ae-meta"><strong>Modules:</strong> ' +
-						escapeHTML(modules) +
-						"<br><strong>Source:</strong> " +
-						escapeHTML(asset.sources.join(", ")) +
-						"</div>" +
-						'<div class="ae-actions"><button class="ae-btn" data-copy="' +
-						url +
-						'">Copy</button>' +
-						'<button class="ae-btn" data-open="' +
-						url +
-						'">Open</button>' +
-						'<button class="ae-btn" data-dl="' +
-						url +
-						'">Save</button>' +
-						"</div></div></div>"
-					);
-				})
-				.join("");
-			this.$grid.querySelectorAll(".ae-audio").forEach(el => this.initPlayer(el));
-			this.initFonts();
-			this.metaEls = new Map();
-			this.$grid.querySelectorAll("[data-meta]").forEach(el => {
-				const url = el.dataset.meta;
-				this.metaEls.set(url, el);
-				this.paintMeta(url);
-				this.queueSize(url);
-			});
-			this.$loadMore.style.display = this.filtered.length > this.visibleCount ? "block" : "none";
+		updateGrid(append = false) {
+			if (!append) {
+				this.filtered = this.getFiltered();
+				this.teardownMedia();
+				if (!this.measureRules) {
+					for (const u of this.sizeQueue) this.getMeta(u).sizeTried = false;
+					this.sizeQueue = [];
+				}
+				this.$grid.textContent = "";
+				this.metaEls = new Map();
+				this.rendered = 0;
+			}
+			const from = this.rendered;
+			const to = Math.min(this.filtered.length, this.visibleCount);
+			if (to > from) {
+				this.$grid.insertAdjacentHTML(
+					"beforeend",
+					this.filtered
+						.slice(from, to)
+						.map(a => this.cardHTML(a))
+						.join("")
+				);
+				this.rendered = to;
+				this.mount(from);
+			}
+			this.$loadMore.style.display = this.filtered.length > to ? "block" : "none";
 			this.updateInfo();
 		}
 
+		cardHTML(a) {
+			const u = escapeHTML(a.url);
+			const n = a.modules.length;
+			const mods = n ? a.modules.slice(0, 3).join(", ") + (n > 3 ? "..." : "") : "N/A";
+			const sel = this.selected.has(a.url);
+			return `<div class="ae-card${sel ? " ae-selected" : ""}" data-url="${u}"><div class="ae-preview"><label class="ae-check"><input type="checkbox"${sel ? " checked" : ""}></label>${this.getPreviewHTML(a)}</div><div class="ae-card-body"><span class="ae-type">${escapeHTML(a.extension || "unknown")}</span><div class="ae-name" title="${u}">${escapeHTML(a.name)}</div><div class="ae-dim">...</div><div class="ae-meta"><strong>Modules:</strong> ${escapeHTML(mods)}<br><strong>Source:</strong> ${escapeHTML(a.sources.join(", "))}</div><div class="ae-actions"><button class="ae-btn" data-a="copy">Copy</button><button class="ae-btn" data-a="open">Open</button><button class="ae-btn" data-a="dl">Save</button></div></div></div>`;
+		}
+
+		mount(from) {
+			const cards = this.$grid.children;
+			for (let i = from; i < cards.length; i++) {
+				const c = cards[i];
+				const url = c.dataset.url;
+				const au = c.querySelector(".ae-audio");
+				if (au) this.initPlayer(au);
+				const lz = c.querySelector("[data-lazy],[data-font]");
+				if (lz) this.lazy(lz);
+				this.metaEls.set(url, c.querySelector(".ae-dim"));
+				this.paintMeta(url);
+				this.queueSize(url);
+			}
+		}
+
 		updateInfo() {
-			this.$info.textContent = this.filtered.length + " Found | " + this.selected.size + " selected";
-			if (this.measureRules && this._mPending) this.$info.textContent += " | measuring " + this._mPending;
-			this.root.querySelectorAll(".dl-n-sel").forEach(el => (el.textContent = this.selected.size));
-			this.root.querySelectorAll(".dl-n-flt").forEach(el => (el.textContent = this.filtered.length));
+			const n = this.filtered.length;
+			const s = this.selected.size;
+			this.$info.textContent = n + " Found | " + s + " selected" + (this.measureRules && this._mPending ? " | measuring " + this._mPending : "");
+			this.$nSel.forEach(el => (el.textContent = s));
+			this.$nFlt.forEach(el => (el.textContent = n));
 		}
 
 		setStatus(text, pct = null, autoHide = 0) {
@@ -1925,17 +2019,17 @@
 			document.body.appendChild(a);
 			a.click();
 			a.remove();
-			setTimeout(() => URL.revokeObjectURL(href), 15000);
+			setTimeout(() => URL.revokeObjectURL(href), 60000);
 		}
 
 		async downloadOne(url, i = 0) {
 			try {
-				const r = await fetch(url);
+				const r = await fetch(url, { signal: this.ac.signal });
 				if (!r.ok) throw new Error(r.status);
 				this.saveBlob(await r.blob(), this.fileNameFor(url, i));
 				return true;
 			} catch {
-				window.open(url, "_blank", "noopener,noreferrer");
+				if (!this.destroyed) window.open(url, "_blank", "noopener,noreferrer");
 				return false;
 			}
 		}
@@ -1968,19 +2062,21 @@
 			const zip = new StoreZip();
 			const used = new Set();
 			const failed = [];
-			const queue = urls.map((u, i) => [u, i]);
+			let next = 0;
 			let done = 0;
 			let bytes = 0;
 			const worker = async () => {
-				while (queue.length) {
-					const [url, i] = queue.shift();
+				while (next < urls.length && !this.destroyed) {
+					const i = next++;
+					const url = urls[i];
 					try {
-						const r = await fetch(url);
+						const r = await fetch(url, { signal: this.ac.signal });
 						if (!r.ok) throw new Error(r.status);
 						const data = new Uint8Array(await r.arrayBuffer());
-						const ext = this.getExtension(url) || "misc";
-						let path = ext + "/" + this.fileNameFor(url, i);
-						for (let n = 2; used.has(path.toLowerCase()); n++) path = path.replace(/(\.[^./]+)?$/, "_" + n + "$1");
+						const dir = this.getExtension(url) || "misc";
+						const name = this.fileNameFor(url, i);
+						let path = dir + "/" + name;
+						for (let n = 2; used.has(path.toLowerCase()); n++) path = dir + "/" + name.replace(/(\.[^./]+)?$/, "_" + n + "$1");
 						used.add(path.toLowerCase());
 						zip.add(path, data);
 						bytes += data.length;
@@ -1993,18 +2089,16 @@
 			};
 			try {
 				await Promise.all(Array.from({ length: 6 }, worker));
+				if (this.destroyed) return;
 				if (!zip.count) return this.setStatus("No files could be fetched (CORS or network).", null, 4000);
 				if (failed.length) {
 					zip.add("_failed.txt", new TextEncoder().encode(failed.join("\n")));
 					console.warn("Failed to fetch:", failed);
 				}
+				const n = zip.count - (failed.length ? 1 : 0);
 				this.saveBlob(zip.finish(), baseName + ".zip");
 				this.setStatus(
-					"ZIP ready: " +
-						(zip.count - (failed.length ? 1 : 0)) +
-						" files" +
-						(failed.length ? ", " + failed.length + " failed (listed in _failed.txt)" : "") +
-						".",
+					"ZIP ready: " + n + " files" + (failed.length ? ", " + failed.length + " failed (listed in _failed.txt)" : "") + ".",
 					null,
 					5000
 				);
@@ -2095,22 +2189,59 @@
 		}
 
 		destroy() {
-			this.teardownAudio();
-			this.closeLightbox();
-			document.removeEventListener("keydown", this.handleEsc);
+			if (this.destroyed) return;
 			this.destroyed = true;
+			this.ac.abort();
+			timers.forEach(clearTimeout);
+			timers.clear();
 			clearTimeout(this._mTimer);
-			this.dimQueue = [];
+			clearTimeout(this._statusTimer);
+			document.removeEventListener("keydown", this.handleEsc);
+			document.removeEventListener("fullscreenchange", this._fsChange);
+			if (document.fullscreenElement && this.root.contains(document.fullscreenElement)) document.exitFullscreen().catch(() => {});
+			this.closeLightbox();
+			this.teardownMedia();
+			for (const u of this.sizeQueue) this.getMeta(u).sizeTried = false;
+			for (const u of this.dimQueue) this.getMeta(u).dimTried = false;
+			for (const [img, u] of this._imgs) {
+				img.onload = img.onerror = null;
+				img.removeAttribute("src");
+				this.getMeta(u).dimTried = false;
+			}
+			this._imgs.clear();
 			this.sizeQueue = [];
-			this.teardownFonts();
+			this.dimQueue = [];
 			this.fontFaces.forEach(e => document.fonts.delete(e.face));
 			this.fontFaces.clear();
 			this._themeMO?.disconnect();
 			this._themeMQ?.removeEventListener?.("change", this._themeMQFn);
 			this.root.remove();
+			this.peakCache.clear();
+			this.actx = null;
+			this.filtered = [];
+			this.rows = [];
+			this.onClose?.();
 		}
 	}
 
-	window.openAssetExplorer = () => new DiscordAssetExplorer();
-	window.openAssetExplorer();
+	let inst = null;
+	const toggle = () => {
+		if (inst) return void inst.destroy();
+		inst = new DiscordAssetExplorer(() => (inst = null));
+	};
+	const onKey = e => {
+		if (e.shiftKey && (e.ctrlKey || e.metaKey) && !e.altKey && !e.repeat && e.code === "KeyK") {
+			e.preventDefault();
+			e.stopImmediatePropagation();
+			toggle();
+		}
+	};
+	window.addEventListener("keydown", onKey, true);
+	window.__assetExplorerDispose = () => {
+		window.removeEventListener("keydown", onKey, true);
+		inst?.destroy();
+		delete window.__assetExplorerDispose;
+	};
+	window.openAssetExplorer = () => inst || toggle();
+	toggle();
 })();
